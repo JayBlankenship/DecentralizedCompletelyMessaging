@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Decentralized Mesh Chat (Relay-Based)</title>
+  <style>
+    body {
+      background-color: #000000;
+      color: #00ff00;
+      font-family: 'Consolas', 'Courier New', monospace;
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      box-sizing: border-box;
+    }
+    h1 {
+      font-size: 1.5em;
+      margin: 0 0 10px;
+      color: #00ff00;
+    }
+    #peerInfo, #connectionStatus, #peerListDisplay, #basePeerStatus, #basePeerIdDisplay, #peerCount {
+      color: #00ff00;
+      margin: 5px 0;
+    }
+    #peerList {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    #peerList li {
+      display: inline;
+      margin-right: 10px;
+      color: #00ff00;
+    }
+    #chatMessages {
+      background-color: #000000;
+      border: 1px solid #00ff00;
+      height: 60vh;
+      overflow-y: auto;
+      padding: 10px;
+      margin: 10px 0;
+      font-size: 1em;
+      white-space: pre-wrap;
+      color: #00ff00;
+    }
+    #chatMessages .my-message {
+      color: #00cc00;
+    }
+    input, button {
+      background-color: #000000;
+      color: #00ff00;
+      border: 1px solid #00ff00;
+      font-family: 'Consolas', 'Courier New', monospace;
+      padding: 5px;
+      margin: 5px 5px 5px 0;
+    }
+    input:focus, button:focus {
+      outline: 1px solid #00cc00;
+    }
+    button:hover {
+      background-color: #00ff00;
+      color: #000000;
+      cursor: pointer;
+    }
+    #messageInput, #targetPeerId {
+      width: 300px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Decentralized Mesh Chat (Relay-Based)</h1>
+  <div>
+    Connected to Base Peer: <span id="basePeerStatus">Disconnected</span>
+    <button onclick="retryConnectToBasePeer()">Retry Connection</button>
+  </div>
+  <div id="peerListDisplay">
+    <strong>Total Known Peers:</strong> <span id="peerCount">0</span> |
+    <strong>Known Peers:</strong>
+    <ul id="peerList"></ul>
+    <strong>Base Peer ID:</strong>
+    <div id="basePeerIdDisplay">Not connected</div>
+  </div>
+  <div id="peerInfo">My peer ID: <span id="myPeerId">Initializing...</span></div>
+  <div id="connectionStatus"></div>
+  <h3>Chat</h3>
+  <div id="chatMessages"></div>
+  <input id="messageInput" placeholder="Type a message" type="text">
+  <input id="targetPeerId" placeholder="Recipient Peer ID (leave blank for broadcast)" type="text">
+  <button onclick="sendMessage()">Send</button>
+
+  <!-- PeerJS -->
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+  <script>
+    const BASE_PEER_ID = 'ExampleBasePeer231-132';
+    const FALLBACK_BASE_PEER_IDS = ['ExampleBasePeer231-133', 'ExampleBasePeer231-134'];
+    const peer = new Peer({
+      host: '0.peerjs.com',
+      port: 443,
+      path: '/',
+      secure: true,
+      config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+    });
+    let basePeer = null;
+    let isInitialized = false;
+    let myPeerId = null;
+    let knownPeers = new Set();
+    let messagesArray = [];
+    let messageQueue = []; // Queue for messages when not connected
+
+    const peerList = document.getElementById('peerList');
+    const basePeerIdDisplay = document.getElementById('basePeerIdDisplay');
+    const basePeerStatus = document.getElementById('basePeerStatus');
+    const peerCount = document.getElementById('peerCount');
+    const chatMessages = document.getElementById('chatMessages');
+    const messageInput = document.getElementById('messageInput');
+    const targetPeerId = document.getElementById('targetPeerId');
+    const peerInfoDiv = document.getElementById('peerInfo');
+    const connectionStatusDiv = document.getElementById('connectionStatus');
+
+    peer.on('open', (id) => {
+      isInitialized = true;
+      myPeerId = id;
+      peerInfoDiv.querySelector('#myPeerId').textContent = id;
+      console.log('My peer ID:', id);
+      tryInitializeBasePeer();
+      sendToBasePeer();
+      startPeerResync();
+      updateUI();
+    });
+
+    peer.on('connection', (conn) => {
+      console.log('Incoming connection from:', conn.peer);
+      if (conn.peer === BASE_PEER_ID) {
+        setupBaseConnection(conn);
+      } else {
+        conn.close();
+      }
+    });
+
+    peer.on('error', (err) => {
+      connectionStatusDiv.textContent = `Peer error: ${err.message}`;
+      console.error('Peer error:', err);
+      updateUI();
+    });
+
+    function tryInitializeBasePeer() {
+      try {
+        basePeer = new Peer(BASE_PEER_ID, {
+          host: '0.peerjs.com',
+          port: 443,
+          path: '/',
+          secure: true,
+          config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }
+        });
+        basePeer.on('open', (id) => {
+          console.log('Base peer ID initialized:', id);
+          connectionStatusDiv.textContent = 'Base peer: New ExampleBasePeer231-132 created';
+          basePeerStatus.textContent = 'Connected (Base)';
+          basePeer.on('connection', (conn) => {
+            console.log('New connection to base peer from:', conn.peer);
+            setupBaseConnection(conn);
+            broadcastKnownPeers(); // Initial broadcast
+            setInterval(() => broadcastKnownPeers(), 5000); // Periodic rebroadcast
+          });
+        });
+        basePeer.on('error', (err) => {
+          console.error('Base peer error (ignored if ID taken):', err);
+          basePeer = null;
+          sendToBasePeer(); // Try connecting as a client if base peer ID is taken
+        });
+      } catch (err) {
+        console.log('Base peer ID taken, connecting as client:', err.message);
+        basePeer = null;
+        sendToBasePeer();
+      }
+    }
+
+    function sendToBasePeer(baseIdIndex = 0) {
+      if (!isInitialized || myPeerId === BASE_PEER_ID) return;
+      const currentBasePeerId = baseIdIndex === 0 ? BASE_PEER_ID : FALLBACK_BASE_PEER_IDS[baseIdIndex - 1];
+      connectionStatusDiv.textContent = `Attempting to connect to base peer: ${currentBasePeerId}`;
+      const conn = peer.connect(currentBasePeerId);
+      conn.on('open', () => {
+        console.log('Connected to base peer:', currentBasePeerId);
+        basePeerStatus.textContent = 'Connected';
+        basePeerIdDisplay.textContent = currentBasePeerId;
+        conn.send({ type: 'newPeer', peerId: myPeerId, status: 'active' }); // Confirm active status
+        conn.send({ type: 'requestPeers' });
+        if (messageQueue.length > 0) {
+          messageQueue.forEach(payload => {
+            conn.send({ ...payload, fromPeerId: myPeerId, status: 'active' }); // Include status
+          });
+          messageQueue = []; // Clear queue after sending
+          connectionStatusDiv.textContent = 'Messages sent to base peer.';
+        }
+        updateUI();
+      });
+      conn.on('data', (data) => {
+        console.log('Received data from base peer:', data);
+        if (data.type === 'peerList') {
+          data.peerIds.forEach(pid => {
+            if (pid !== myPeerId && pid !== currentBasePeerId && data.status === 'active') {
+              knownPeers.add(pid);
+            } else if (data.status === 'die') {
+              knownPeers.delete(pid);
+            }
+          });
+          updateUI();
+        } else if (data.type === 'message') {
+          handleMessage(data);
+          if (data.fromPeerId && data.status === 'active') {
+            knownPeers.add(data.fromPeerId); // Update knownPeers on message
+          } else if (data.status === 'die') {
+            knownPeers.delete(data.fromPeerId);
+          }
+        }
+      });
+      conn.on('error', (err) => {
+        basePeerStatus.textContent = 'Error';
+        connectionStatusDiv.textContent = `Base connection error: ${err.message}`;
+        console.error('Base connection error:', err);
+        if (baseIdIndex < FALLBACK_BASE_PEER_IDS.length) {
+          setTimeout(() => sendToBasePeer(baseIdIndex + 1), 2000);
+        } else {
+          setTimeout(() => sendToBasePeer(0), 5000); // Retry from primary
+        }
+        updateUI();
+      });
+      conn.on('close', () => {
+        basePeerStatus.textContent = 'Disconnected';
+        basePeerIdDisplay.textContent = 'Not connected';
+        console.log('Base peer connection closed:', currentBasePeerId);
+        updateUI();
+      });
+      setTimeout(() => conn.close(), 1000); // 1-second window
+    }
+
+    function retryConnectToBasePeer() {
+      if (isInitialized && myPeerId !== BASE_PEER_ID) {
+        connectionStatusDiv.textContent = 'Retrying connection to base peer...';
+        sendToBasePeer();
+      }
+    }
+
+    function setupBaseConnection(conn) {
+      conn.on('open', () => {
+        console.log('Base peer connection open with:', conn.peer);
+        if (basePeer) {
+          knownPeers.add(conn.peer);
+          broadcastKnownPeers();
+        }
+        conn.on('data', (data) => {
+          console.log('Base peer received data:', data);
+          if (data.type === 'newPeer' && data.status === 'active') {
+            knownPeers.add(data.peerId);
+            broadcastToBasePeers({ type: 'newPeer', peerId: data.peerId, status: 'active' });
+            updateUI();
+          } else if (data.type === 'requestPeers') {
+            broadcastKnownPeers();
+          } else if (data.type === 'message') {
+            forwardMessage(data, conn.peer);
+            if (data.fromPeerId && data.status === 'active') {
+              knownPeers.add(data.fromPeerId); // Update on message
+            } else if (data.status === 'die') {
+              knownPeers.delete(data.fromPeerId);
+            }
+          }
+        });
+        conn.on('close', () => {
+          console.log('Base peer connection closed with:', conn.peer);
+          // Do not remove from knownPeers here
+          updateUI();
+        });
+        conn.on('error', (err) => {
+          console.error('Base peer connection error:', err);
+          connectionStatusDiv.textContent = `Base peer connection error with ${conn.peer}: ${err.message}`;
+        });
+      });
+    }
+
+    function broadcastToBasePeers(data) {
+      if (basePeer && basePeer.connections) {
+        console.log('Broadcasting', data.type, 'to connections');
+        Object.values(basePeer.connections).forEach(conns => {
+          conns.forEach(conn => {
+            if (conn.open) {
+              console.log('Sending', data.type, data.peerId || '', 'to', conn.peer);
+              conn.send(data);
+            } else {
+              console.log('Removing closed connection:', conn.peer);
+              // Do not remove from knownPeers here
+            }
+          });
+        });
+        updateUI();
+      }
+    }
+
+    function broadcastKnownPeers() {
+      if (basePeer && basePeer.connections) {
+        const peerList = Array.from(knownPeers).concat(myPeerId ? [myPeerId] : []);
+        console.log('Broadcasting peer list:', peerList);
+        Object.values(basePeer.connections).forEach(conns => {
+          conns.forEach(conn => {
+            if (conn.open) {
+              conn.send({ type: 'peerList', peerIds: peerList, status: 'active' });
+            }
+          });
+        });
+      }
+    }
+
+    function forwardMessage(data, fromPeerId) {
+      if (basePeer && basePeer.connections) {
+        console.log('Forwarding message from', fromPeerId, 'to', data.to || 'all');
+        Object.values(basePeer.connections).forEach(conns => {
+          conns.forEach(conn => {
+            if (conn.open && conn.peer !== fromPeerId) {
+              if (!data.to || data.to === conn.peer) {
+                conn.send({ type: 'message', messages: data.messages, fromPeerId: fromPeerId, status: data.status || 'active' });
+              }
+            }
+          });
+        });
+      }
+      if (!data.to || data.to === myPeerId) {
+        handleMessage(data);
+      }
+    }
+
+    function handleMessage(data) {
+      console.log('Handling message data:', data);
+      data.messages.forEach((m) => {
+        if (!messagesArray.some((existing) => existing.id === m.id)) {
+          console.log('Adding new message:', m);
+          messagesArray.push(m);
+        }
+      });
+      messagesArray.sort((a, b) => a.timestamp - b.timestamp);
+      if (data.fromPeerId && data.status === 'active') {
+        knownPeers.add(data.fromPeerId); // Update knownPeers on message
+      } else if (data.status === 'die') {
+        knownPeers.delete(data.fromPeerId);
+      }
+      updateUI();
+    }
+
+    function sendMessage() {
+      if (!isInitialized) {
+        connectionStatusDiv.textContent = 'Error: Peer not initialized. Please wait.';
+        return;
+      }
+      const text = messageInput.value.trim();
+      if (!text) {
+        connectionStatusDiv.textContent = 'Error: Message cannot be empty.';
+        return;
+      }
+      const targetId = targetPeerId.value.trim();
+      const message = {
+        id: `${myPeerId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        peerId: myPeerId,
+        text: text,
+        timestamp: Date.now(),
+      };
+      messagesArray.push(message);
+      messagesArray.sort((a, b) => a.timestamp - b.timestamp);
+      const payload = { type: 'message', messages: [message], to: targetId || null, fromPeerId: myPeerId, status: 'active' };
+      
+      messageQueue.push(payload);
+      connectionStatusDiv.textContent = 'Message queued: Sending to base peer...';
+      sendToBasePeer();
+      messageInput.value = '';
+      targetPeerId.value = '';
+      updateUI();
+    }
+
+    function sendQueuedMessages() {
+      // No longer needed with transient connections, handled by sendToBasePeer
+    }
+
+    function startPeerResync() {
+      setInterval(() => {
+        if (isInitialized && myPeerId !== BASE_PEER_ID) {
+          console.log('Resyncing peers via base peer');
+          sendToBasePeer();
+        } else {
+          console.log('Resync skipped: Not initialized or I am base peer');
+        }
+      }, 5000);
+    }
+
+    function updateUI() {
+      const visiblePeers = Array.from(knownPeers).filter(pid => pid !== BASE_PEER_ID && pid !== myPeerId);
+      peerCount.textContent = visiblePeers.length;
+      peerList.innerHTML = visiblePeers.map(pid => `<li>${pid}</li>`).join('');
+      basePeerIdDisplay.textContent = (basePeerStatus.textContent === 'Connected') ? basePeerIdDisplay.textContent : 'Not connected';
+      basePeerStatus.textContent = (myPeerId === BASE_PEER_ID) ? 'Connected (Base)' : basePeerStatus.textContent;
+      chatMessages.innerHTML = messagesArray
+        .map((m) => {
+          const isMyMessage = m.peerId === myPeerId;
+          return `<div${isMyMessage ? ' class="my-message"' : ''}>${m.peerId}: ${m.text}</div>`;
+        })
+        .join('');
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    window.sendMessage = sendMessage;
+    window.retryConnectToBasePeer = retryConnectToBasePeer;
+  </script>
+</body>
+</html>
