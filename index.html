@@ -446,8 +446,9 @@
         connectToNeighbors();
         updateUI();
       } else if (data.type === 'new-peer') {
-        // Log and propagate new peer up the chain
-        logDiag(`[Relay] Received new peer (${data.newPeerId}) from ${conn ? conn.peer : 'base'}; myPeerId=${myPeerId}`,'#ffaa00');
+        // Always log propagation debug messages
+        logDiag(`[PROPAGATE] Received new peer (${data.newPeerId}) from ${conn ? conn.peer : 'base'}; myPeerId=${myPeerId}`,'#ffaa00');
+        let updated = false;
         // If this peer is not in our chain, add it in the correct position
         if (!chain.includes(data.newPeerId)) {
           const myIdx = chain.indexOf(myPeerId);
@@ -456,17 +457,36 @@
           } else {
             chain.push(data.newPeerId);
           }
-          logDiag(`[Relay] Added propagated peer to chain: ${data.newPeerId}`,'#ffaa00');
-          updateChainLinks();
-          connectToNeighbors();
-          updateUI();
+          logDiag(`[PROPAGATE] Added propagated peer to chain: ${data.newPeerId}`,'#ffaa00');
+          updated = true;
         }
+        // Always update links and UI, even if not updated, to ensure UI is correct
+        updateChainLinks();
+        connectToNeighbors();
+        updateUI();
         // If not at the end, relay to next
-        if (nextConn && nextConn.open && nextPeerId) {
-          logDiag(`[Relay] Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
-          nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
+        if (nextPeerId) {
+          // If nextConn is open, relay immediately
+          if (nextConn && nextConn.open) {
+            logDiag(`[PROPAGATE] Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
+            nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
+          } else {
+            // Wait for nextConn to open, then relay
+            logDiag(`[PROPAGATE] Waiting for nextConn to open to relay new peer (${data.newPeerId}) to ${nextPeerId}`, '#ffaa00');
+            // Set up a one-time relay on open
+            const tryRelay = () => {
+              if (nextConn && nextConn.open) {
+                logDiag(`[PROPAGATE] (Delayed) Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
+                nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
+                nextConn.off('open', tryRelay);
+              }
+            };
+            if (nextConn) {
+              nextConn.on('open', tryRelay);
+            }
+          }
         } else {
-          logDiag(`[Relay] At back of chain (no nextPeerId). Propagation ends here.`, '#ffaa00');
+          logDiag(`[PROPAGATE] At back of chain (no nextPeerId). Propagation ends here.`, '#ffaa00');
         }
       } else if (data.type === 'message') {
         handleMessage(data);
