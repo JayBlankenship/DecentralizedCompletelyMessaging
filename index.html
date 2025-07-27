@@ -353,6 +353,9 @@
           logDiag(`[Conn] Connected to prev: ${prevPeerId}`);
         });
         prevConn.on('data', (data) => handleData(prevConn, data));
+        prevConn.on('close', () => {
+          logDiag(`[Conn] Prev connection closed, will attempt reconnect`, '#ff4444');
+        });
       }
       // Connect to next peer
       if (nextPeerId) {
@@ -361,10 +364,31 @@
           logDiag(`[Conn] Connected to next: ${nextPeerId}`);
         });
         nextConn.on('data', (data) => handleData(nextConn, data));
+        nextConn.on('close', () => {
+          logDiag(`[Conn] Next connection closed, will attempt reconnect`, '#ff4444');
+        });
       }
       // Always update UI after attempting neighbor connections
       updateUI();
     }
+
+    // Periodically check and reconnect to neighbors if needed
+    setInterval(() => {
+      if (!isInitialized) return;
+      // If neighbor connection is missing or closed, try to reconnect
+      if (prevPeerId && (!prevConn || prevConn.open === false)) {
+        logDiag(`[Auto] Reconnecting to prev: ${prevPeerId}`, '#00ccff');
+        prevConn = peer.connect(prevPeerId);
+        prevConn.on('open', () => logDiag(`[Auto] Reconnected to prev: ${prevPeerId}`));
+        prevConn.on('data', (data) => handleData(prevConn, data));
+      }
+      if (nextPeerId && (!nextConn || nextConn.open === false)) {
+        logDiag(`[Auto] Reconnecting to next: ${nextPeerId}`, '#00ccff');
+        nextConn = peer.connect(nextPeerId);
+        nextConn.on('open', () => logDiag(`[Auto] Reconnected to next: ${nextPeerId}`));
+        nextConn.on('data', (data) => handleData(nextConn, data));
+      }
+    }, 5000);
 
     function handleData(conn, data) {
       if (data.type === 'chain') {
