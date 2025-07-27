@@ -161,10 +161,15 @@
         <input id="targetPeerId" placeholder="Recipient Peer ID (leave blank for broadcast)" type="text">
         <button onclick="sendMessage()">Send</button>
       </div>
-      <div class="output-panel" id="outputPanel">
-        <strong>Diagnostics & State:</strong>
-        <div id="diagnostics"></div>
-      </div>
+    <div class="output-panel" id="outputPanel">
+      <strong>Diagnostics & State:</strong>
+      <div id="diagnosticsStatic"></div>
+      <div id="diagnostics"></div>
+    </div>
+    <div class="output-panel" id="chainLogPanel">
+      <strong>Chain Propagation Log:</strong>
+      <div id="chainLog"></div>
+    </div>
     </div>
     <div class="side-panel">
       <h3>Peer Chain</h3>
@@ -208,14 +213,22 @@
     const connectionStatusDiv = document.getElementById('connectionStatus');
     const outputPanel = document.getElementById('outputPanel');
     const diagnosticsDiv = document.getElementById('diagnostics');
+    const diagnosticsStaticDiv = document.getElementById('diagnosticsStatic');
     const peerChainList = document.getElementById('peerChainList');
     const frontPeerIdSpan = document.getElementById('frontPeerId');
     const backPeerIdSpan = document.getElementById('backPeerId');
     const frontConnStatusSpan = document.getElementById('frontConnStatus');
     const backConnStatusSpan = document.getElementById('backConnStatus');
+    const chainLogDiv = document.getElementById('chainLog');
+
+    function logChainEvent(msg, color='#ffaa00') {
+      // Append log message, never clear or truncate
+      chainLogDiv.insertAdjacentHTML('beforeend', `<div style='color:${color}'>${msg}</div>`);
+      chainLogDiv.scrollTop = chainLogDiv.scrollHeight;
+    }
 
     function logDiag(msg, color='#44ff44') {
-      diagnosticsDiv.innerHTML += `<div style='color:${color}'>${msg}</div>`;
+      diagnosticsDiv.insertAdjacentHTML('beforeend', `<div style='color:${color}'>${msg}</div>`);
       diagnosticsDiv.scrollTop = diagnosticsDiv.scrollHeight;
     }
 
@@ -246,8 +259,8 @@
             logDiag(`[Conn] Added unknown peer to chain: ${conn.peer}`,'#ffaa00');
             updateChainLinks();
             connectToNeighbors();
-            updateUI();
           }
+          updateUI(); // Always update UI on incoming connection
         });
         conn.on('close', () => logDiag(`[Conn] Connection closed: ${conn.peer}`, '#ff4444'));
         conn.on('error', (err) => logDiag(`[Conn] Error: ${err.message}`, '#ff4444'));
@@ -281,14 +294,23 @@
               // Add new peer to chain
               if (!chain.includes(data.peerId)) {
                 chain.push(data.peerId);
-                logDiag(`[Base] Added ${data.peerId} to chain`);
-                // Start propagating the new peer up the chain
-                propagateNewPeer(data.peerId, 1);
+                const visualLogMsg = `[Base] Added ${data.peerId} to chain`;
+                logDiag(visualLogMsg);
+                // --- Ensure base updates its own state and UI ---
+                updateChainLinks();
+                connectToNeighbors();
+                updateUI();
+                // Propagate the visual log message down the chain
+                if (chain.length > 1 && basePeerConnections[chain[1]]) {
+                  basePeerConnections[chain[1]].send({ type: 'visual-log', msg: visualLogMsg, color: '#ffaa00' });
+                }
+                // Start propagating the new peer from the FRONT of the chain (idx 1)
+                propagateNewPeerFromFront(data.peerId);
               }
               // Register connection for broadcasting
               basePeerConnections[data.peerId] = conn;
-              // Send chain to all peers (including self)
-              broadcastChain();
+              // Only send the full chain to the joining peer
+              conn.send({ type: 'chain', chain: [...chain] });
             }
           });
           conn.on('close', () => {
@@ -308,13 +330,14 @@
       });
     }
 
-    // Propagate new peer join up the chain, one hop at a time
-    function propagateNewPeer(newPeerId, idx) {
-      if (chain.length <= idx) return;
-      const nextPeer = chain[idx];
-      if (basePeerConnections[nextPeer]) {
-        logDiag(`[Propagate] Sending new peer (${newPeerId}) to ${nextPeer}`);
-        basePeerConnections[nextPeer].send({ type: 'new-peer', newPeerId });
+
+    // Propagate new peer join from the front of the chain, hop-by-hop
+    function propagateNewPeerFromFront(newPeerId) {
+      if (chain.length < 2) return; // No one to propagate to
+      const firstPeer = chain[1];
+      if (basePeerConnections[firstPeer]) {
+        logDiag(`[Propagate] Starting propagation of new peer (${newPeerId}) at front: ${firstPeer}`);
+        basePeerConnections[firstPeer].send({ type: 'new-peer', newPeerId });
       }
     }
 
@@ -378,7 +401,7 @@
       if (nextConn) { nextConn.close(); nextConn = null; }
       let prevConnected = false;
       let nextConnected = false;
-      // Connect to previous peer
+      // Connect to previous peer (if not base)
       if (prevPeerId) {
         prevConn = peer.connect(prevPeerId);
         prevConn.on('open', () => {
@@ -393,7 +416,7 @@
       } else {
         prevConnected = true; // No prev needed
       }
-      // Connect to next peer
+      // Connect to next peer (including base)
       if (nextPeerId) {
         nextConn = peer.connect(nextPeerId);
         nextConn.on('open', () => {
@@ -441,52 +464,76 @@
 
     function handleData(conn, data) {
       if (data.type === 'chain') {
-        chain = data.chain;
-        updateChainLinks();
-        connectToNeighbors();
-        updateUI();
-      } else if (data.type === 'new-peer') {
-        // Always log propagation debug messages
-        logDiag(`[PROPAGATE] Received new peer (${data.newPeerId}) from ${conn ? conn.peer : 'base'}; myPeerId=${myPeerId}`,'#ffaa00');
-        let updated = false;
-        // If this peer is not in our chain, add it in the correct position
-        if (!chain.includes(data.newPeerId)) {
-          const myIdx = chain.indexOf(myPeerId);
-          if (myIdx !== -1) {
-            chain.splice(myIdx + 1, 0, data.newPeerId);
-          } else {
-            chain.push(data.newPeerId);
-          }
-          logDiag(`[PROPAGATE] Added propagated peer to chain: ${data.newPeerId}`,'#ffaa00');
-          updated = true;
+        // Only update chain from base peer (on join)
+        if (conn === null || (conn && conn.peer === BASE_PEER_ID)) {
+          chain = data.chain;
+          updateChainLinks();
+          connectToNeighbors();
+          updateUI();
         }
-        // Always update links and UI, even if not updated, to ensure UI is correct
+      } else if (data.type === 'visual-log') {
+        // Visual log propagation: log and relay to next
+        logDiag(data.msg, data.color || '#ffaa00');
+        if (nextConn && nextConn.open) {
+          nextConn.send(data);
+        } else if (nextPeerId) {
+          // If nextConn not open, relay when it opens
+          const tryRelayVisual = () => {
+            if (nextConn && nextConn.open) {
+              nextConn.send(data);
+              nextConn.off('open', tryRelayVisual);
+              nextConn._relayVisualListener = null;
+            }
+          };
+          if (nextConn) {
+            if (nextConn._relayVisualListener) nextConn.off('open', nextConn._relayVisualListener);
+            nextConn._relayVisualListener = tryRelayVisual;
+            nextConn.on('open', tryRelayVisual);
+          }
+        }
+      } else if (data.type === 'new-peer') {
+        // Always log propagation debug messages, even if already present
+        logDiag(`[PROPAGATE] Received new peer (${data.newPeerId}) from ${conn ? conn.peer : 'base'}; myPeerId=${myPeerId}`,'#ffaa00');
+        logChainEvent(`Received new peer <b>${data.newPeerId}</b> from <b>${conn ? conn.peer : 'base'}</b> (myPeerId=<b>${myPeerId}</b>)`);
+        let added = false;
+        if (!chain.includes(data.newPeerId)) {
+          chain.push(data.newPeerId);
+          logDiag(`[PROPAGATE] Added propagated peer to chain: ${data.newPeerId}`,'#ffaa00');
+          logChainEvent(`Added propagated peer <b>${data.newPeerId}</b> to chain.`);
+          added = true;
+        }
         updateChainLinks();
         connectToNeighbors();
-        updateUI();
-        // If not at the end, relay to next
+        updateUI(); // Always update UI, even if not added
+        // Relay to next if not at the end
         if (nextPeerId) {
-          // If nextConn is open, relay immediately
           if (nextConn && nextConn.open) {
             logDiag(`[PROPAGATE] Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
+            logChainEvent(`Relaying new peer <b>${data.newPeerId}</b> to <b>${nextPeerId}</b> (from <b>${myPeerId}</b>)`);
             nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
           } else {
-            // Wait for nextConn to open, then relay
             logDiag(`[PROPAGATE] Waiting for nextConn to open to relay new peer (${data.newPeerId}) to ${nextPeerId}`, '#ffaa00');
-            // Set up a one-time relay on open
+            logChainEvent(`Waiting for nextConn to open to relay <b>${data.newPeerId}</b> to <b>${nextPeerId}</b>`);
+            if (nextConn && nextConn._relayListener) {
+              nextConn.off('open', nextConn._relayListener);
+            }
             const tryRelay = () => {
               if (nextConn && nextConn.open) {
                 logDiag(`[PROPAGATE] (Delayed) Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
+                logChainEvent(`(Delayed) Relaying <b>${data.newPeerId}</b> to <b>${nextPeerId}</b> (from <b>${myPeerId}</b>)`);
                 nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
                 nextConn.off('open', tryRelay);
+                nextConn._relayListener = null;
               }
             };
             if (nextConn) {
+              nextConn._relayListener = tryRelay;
               nextConn.on('open', tryRelay);
             }
           }
         } else {
           logDiag(`[PROPAGATE] At back of chain (no nextPeerId). Propagation ends here.`, '#ffaa00');
+          logChainEvent(`At back of chain (no nextPeerId). Propagation ends here.`);
         }
       } else if (data.type === 'message') {
         handleMessage(data);
@@ -569,6 +616,7 @@
         if (pid === myPeerId) li.style.color = '#00ffcc';
         peerChainList.appendChild(li);
       });
+      // Never clear the chainLogDiv here or anywhere else
       // Base peer indicator
       const basePeerIndicator = document.getElementById('basePeerIndicator');
       if (isBase) {
@@ -578,8 +626,8 @@
         basePeerIndicator.textContent = 'You are a CLIENT peer';
         basePeerIndicator.style.color = '#00ccff';
       }
-      // Diagnostics
-      diagnosticsDiv.innerHTML = `
+      // Diagnostics (static info only, never clear logs)
+      diagnosticsStaticDiv.innerHTML = `
         <div><strong>My Peer ID:</strong> ${myPeerId}</div>
         <div><strong>Prev Peer ID:</strong> ${prevPeerId}</div>
         <div><strong>Next Peer ID:</strong> ${nextPeerId}</div>
