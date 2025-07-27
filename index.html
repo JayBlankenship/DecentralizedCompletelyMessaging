@@ -232,7 +232,23 @@
       });
       peer.on('connection', (conn) => {
         conn.on('data', (data) => handleData(conn, data));
-        conn.on('open', () => logDiag(`[Conn] Incoming connection from ${conn.peer}`));
+        conn.on('open', () => {
+          logDiag(`[Conn] Incoming connection from ${conn.peer}`);
+          // If this peer is not in our chain, add it and update UI
+          if (!chain.includes(conn.peer)) {
+            // Insert at the correct position: if we are not base, add after us
+            const myIdx = chain.indexOf(myPeerId);
+            if (myIdx !== -1) {
+              chain.splice(myIdx + 1, 0, conn.peer);
+            } else {
+              chain.push(conn.peer);
+            }
+            logDiag(`[Conn] Added unknown peer to chain: ${conn.peer}`,'#ffaa00');
+            updateChainLinks();
+            connectToNeighbors();
+            updateUI();
+          }
+        });
         conn.on('close', () => logDiag(`[Conn] Connection closed: ${conn.peer}`, '#ff4444'));
         conn.on('error', (err) => logDiag(`[Conn] Error: ${err.message}`, '#ff4444'));
       });
@@ -266,6 +282,8 @@
               if (!chain.includes(data.peerId)) {
                 chain.push(data.peerId);
                 logDiag(`[Base] Added ${data.peerId} to chain`);
+                // Start propagating the new peer up the chain
+                propagateNewPeer(data.peerId, 1);
               }
               // Register connection for broadcasting
               basePeerConnections[data.peerId] = conn;
@@ -290,15 +308,27 @@
       });
     }
 
+    // Propagate new peer join up the chain, one hop at a time
+    function propagateNewPeer(newPeerId, idx) {
+      if (chain.length <= idx) return;
+      const nextPeer = chain[idx];
+      if (basePeerConnections[nextPeer]) {
+        logDiag(`[Propagate] Sending new peer (${newPeerId}) to ${nextPeer}`);
+        basePeerConnections[nextPeer].send({ type: 'new-peer', newPeerId });
+      }
+    }
+
+    // Track base connection for later disconnect
+    let baseConn = null;
     function joinChain() {
       chainStatus.textContent = 'Joining chain...';
       // Connect to base peer and request to join
-      const conn = peer.connect(BASE_PEER_ID);
-      conn.on('open', () => {
-        conn.send({ type: 'join', peerId: myPeerId });
+      baseConn = peer.connect(BASE_PEER_ID);
+      baseConn.on('open', () => {
+        baseConn.send({ type: 'join', peerId: myPeerId });
         logDiag(`[Join] Sent join request to base`);
       });
-      conn.on('data', (data) => {
+      baseConn.on('data', (data) => {
         if (data.type === 'chain') {
           chain = data.chain;
           updateChainLinks();
@@ -308,7 +338,7 @@
           updateUI();
         }
       });
-      conn.on('error', (err) => {
+      baseConn.on('error', (err) => {
         chainStatus.textContent = 'Failed to join chain';
         logDiag(`[Join] Error: ${err.message}`, '#ff4444');
       });
@@ -346,30 +376,49 @@
       // Disconnect old
       if (prevConn) { prevConn.close(); prevConn = null; }
       if (nextConn) { nextConn.close(); nextConn = null; }
+      let prevConnected = false;
+      let nextConnected = false;
       // Connect to previous peer
       if (prevPeerId) {
         prevConn = peer.connect(prevPeerId);
         prevConn.on('open', () => {
           logDiag(`[Conn] Connected to prev: ${prevPeerId}`);
+          prevConnected = true;
+          tryDisconnectBaseIfReady();
         });
         prevConn.on('data', (data) => handleData(prevConn, data));
         prevConn.on('close', () => {
           logDiag(`[Conn] Prev connection closed, will attempt reconnect`, '#ff4444');
         });
+      } else {
+        prevConnected = true; // No prev needed
       }
       // Connect to next peer
       if (nextPeerId) {
         nextConn = peer.connect(nextPeerId);
         nextConn.on('open', () => {
           logDiag(`[Conn] Connected to next: ${nextPeerId}`);
+          nextConnected = true;
+          tryDisconnectBaseIfReady();
         });
         nextConn.on('data', (data) => handleData(nextConn, data));
         nextConn.on('close', () => {
           logDiag(`[Conn] Next connection closed, will attempt reconnect`, '#ff4444');
         });
+      } else {
+        nextConnected = true; // No next needed
       }
       // Always update UI after attempting neighbor connections
       updateUI();
+
+      // Helper to disconnect from base if both neighbor connections are ready
+      function tryDisconnectBaseIfReady() {
+        if (prevConnected && nextConnected && baseConn) {
+          logDiag('[Chain] Disconnecting from base peer (fully chained)');
+          baseConn.close();
+          baseConn = null;
+        }
+      }
     }
 
     // Periodically check and reconnect to neighbors if needed
@@ -396,6 +445,29 @@
         updateChainLinks();
         connectToNeighbors();
         updateUI();
+      } else if (data.type === 'new-peer') {
+        // Log and propagate new peer up the chain
+        logDiag(`[Relay] Received new peer (${data.newPeerId}) from ${conn ? conn.peer : 'base'}; myPeerId=${myPeerId}`,'#ffaa00');
+        // If this peer is not in our chain, add it in the correct position
+        if (!chain.includes(data.newPeerId)) {
+          const myIdx = chain.indexOf(myPeerId);
+          if (myIdx !== -1) {
+            chain.splice(myIdx + 1, 0, data.newPeerId);
+          } else {
+            chain.push(data.newPeerId);
+          }
+          logDiag(`[Relay] Added propagated peer to chain: ${data.newPeerId}`,'#ffaa00');
+          updateChainLinks();
+          connectToNeighbors();
+          updateUI();
+        }
+        // If not at the end, relay to next
+        if (nextConn && nextConn.open && nextPeerId) {
+          logDiag(`[Relay] Relaying new peer (${data.newPeerId}) to ${nextPeerId} (from ${myPeerId})`, '#ffaa00');
+          nextConn.send({ type: 'new-peer', newPeerId: data.newPeerId });
+        } else {
+          logDiag(`[Relay] At back of chain (no nextPeerId). Propagation ends here.`, '#ffaa00');
+        }
       } else if (data.type === 'message') {
         handleMessage(data);
         // Relay message if not already seen
